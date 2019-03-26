@@ -4,6 +4,9 @@ import operator
 import numpy as np
 from scipy.optimize import brentq
 import astropy.units as u
+from astropy.constants import c
+import naima.models
+import naima.radiative
 from astropy.table import Table
 from ..utils.energy import EnergyBounds
 from ..utils.nddata import NDDataArray, BinnedDataAxis
@@ -25,6 +28,8 @@ __all__ = [
     "TableModel",
     "AbsorbedSpectralModel",
     "Absorption",
+    "NaimaModel",
+    "SynchrotronSelfCompton",
 ]
 
 
@@ -1464,3 +1469,270 @@ class AbsorbedSpectralModel(SpectralModel):
         flux = self.spectral_model.evaluate(energy=energy, **kwargs)
         absorption = self.absorption.evaluate(energy=energy, parameter=parameter)
         return flux * absorption
+
+
+class NaimaModel(SpectralModel):
+    r"""A wrapper for `Naima <https://naima.readthedocs.io/en/latest/>`_ models
+
+    This model convolves a `particle_distribution`, describing an assumed electron
+    or proton energy spectrum, with a `radiative_model`. The latter is used to compute the non-thermal
+    :math:`\gamma`-ray flux, observed at a given `distance` to the source, originating from the interactions
+    between the parent population of charged particles and the interstellar distributions of matter,
+    radiation or magnetic field.
+
+
+    Parameters
+    ----------
+    particle_distribution : `str`
+        One of the energy distributions defined in `naima.models`.
+    particle_parameters : `dict`
+        Dictionary of parameters defining the `particle_distribution`.
+    radiative_model : `str`
+        One of the non-thermal radiative models defined in `naima.radiative`.
+    radiative_parameters : `dict`
+        Dictionary of parameters defining the `radiative_model`.
+    distance : :class:`~astropy.units.Quantity` (optional)
+        Distance to the source. If set to 0, the intrinsic differential luminosity will be returned. Default is 1 kpc.
+
+
+    Examples
+    --------
+    Create and plot a model that convolves an exponential cutoff proton `particle_distribution`
+    with a :math:`\pi^0`-decay `radiative_model`:
+
+    .. plot::
+        :include-source:
+
+        from gammapy.spectrum.models import NaimaModel
+        from astropy import units as u
+        import numpy as np
+        import matplotlib.pyplot as plt
+
+        particle_parameters={
+            'amplitude' : 2e33 / u.eV,
+            'e_0' : 10 * u.TeV,
+            'alpha' : 2.5,
+             'e_cutoff' : 10 * u.TeV,
+        }
+        radiative_parameters={'nh' : 1.0 * u.cm ** -3}
+        PionDecay_ECPL = NaimaModel(
+            particle_distribution="ExponentialCutoffPowerLaw",
+            particle_parameters=particle_parameters,
+            radiative_model="PionDecay",
+            radiative_parameters=radiative_parameters
+        )
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+        opts = {
+            "energy_range": [10 * u.GeV, 80 * u.TeV],
+            "energy_power": 2,
+            "flux_unit": "erg-1 cm-2 s-1",
+        }
+        ax.set_ylim([3e-13, 5e-10]);
+
+        PionDecay_ECPL.plot(**opts)
+        plt.show()
+    """
+
+    __slots__ = ["particle_distribution", "radiative_model", "distance"]
+
+    def __init__(
+        self,
+        particle_distribution,
+        particle_parameters,
+        radiative_model,
+        radiative_parameters,
+        distance=1.0 * u.kpc,
+    ):
+        self.particle_distribution = self._get_from_naima(
+            particle_distribution, particle_parameters
+        )
+        radiative_parameters.update(particle_distribution=self.particle_distribution)
+        self.radiative_model = self._get_from_naima(
+            radiative_model, radiative_parameters
+        )
+        self.distance = Parameter("distance", distance)
+        #     add the possibility to normalize using the (observed) gamma-ray energy flux
+        super().__init__([self.distance])
+
+    def __call__(self, energy, distance=None):
+        """Call evaluate method"""
+        if distance == None:
+            distance = self.distance.quantity
+        eval = self.evaluate(energy.flatten(), self.radiative_model, distance)
+        return eval.reshape(energy.shape)
+
+    def _get_from_naima(self, name, kwargs):
+        return {
+            "Synchrotron": naima.radiative.Synchrotron,
+            "InverseCompton": naima.radiative.InverseCompton,
+            "PionDecay": naima.radiative.PionDecay,
+            "PionDecayKelner06": naima.radiative.PionDecayKelner06,
+            "Bremsstrahlung": naima.radiative.Bremsstrahlung,
+            "BrokenPowerLaw": naima.models.BrokenPowerLaw,
+            "ExponentialCutoffPowerLaw": naima.models.ExponentialCutoffPowerLaw,
+            "PowerLaw": naima.models.PowerLaw,
+            "LogParabola": naima.models.LogParabola,
+            "ExponentialCutoffBrokenPowerLaw": naima.models.ExponentialCutoffBrokenPowerLaw,
+            "TableModel": naima.models.TableModel,
+            "EblAbsorptionModel": naima.models.EblAbsorptionModel,
+        }[name](**kwargs)
+
+    @staticmethod
+    def evaluate(energy, radiative_model, distance):
+        """Evaluate the model (static function)."""
+        dnde = radiative_model.flux(energy, distance=distance)
+        return dnde.to("cm-2 s-1 TeV-1")
+
+
+class SynchrotronSelfCompton:
+    r"""A Syncrotron Self Compton spectral model, based on `Naima <https://naima.readthedocs.io/en/latest/>`_ models
+
+    This model convolves a `particle_distribution`, describing an assumed electron
+    energy spectrum, with the synchrotron `radiative_model` defined in `naima.radiative`. The latter is used, under the
+     assumption that the source is spherycally symmetric, to compute the synchrotron photon field to be passed
+      (along with the CMB, FIR, etc.) as a seed for the inverse Compton `radiative_model`.
+
+
+    Parameters
+    ----------
+    particle_distribution : `str`
+        One of the energy distributions defined in `naima.models`.
+    particle_parameters : `dict`
+        Dictionary of parameters defining the `particle_distribution`.
+    radiative_parameters : `dict`
+        Dictionary of parameters defining the both the Synchrotson and the InverseCompton `radiative_model`s.
+        Those are, respectively, the intensity of the magnetic field `"B"` and a list of the '"seed_photon_fields"'.
+    distance : :class:`~astropy.units.Quantity` (optional)
+        Distance to the source. If set to 0, the intrinsic differential luminosity will be returned. Default is 1 kpc.
+    source_radius: :class:`~astropy.units.Quantity`
+        Radius of the spherically symmetric source.
+    syn_emin: :class:`~astropy.units.Quantity`
+        Minimum energy used to compute the synchrotron seed photon field. The energy range should
+         capture most of the synchrotron output.
+
+    syn_emax: :class:`~astropy.units.Quantity`
+        Maximum energy used to compute the synchrotron seed photon field. The energy range should
+         capture most of the synchrotron output.
+    num: `float` (optional)
+        Number of logarithmic energy bins used to compute the synchrotron seed photon field. Default is 100.
+
+
+    Examples
+    --------
+    Create and plot a model that convolves an exponential cutoff electron `particle_distribution`
+    with a synchrotron self Compton radiative model, in the presence of a magnetic field :math:`B=100\,\mu G` and the
+    CMB, FIR and NIR photon fields.
+
+    .. plot::
+        :include-source:
+
+        from gammapy.spectrum.models import NaimaModel
+        from astropy import units as u
+        import numpy as np
+        import matplotlib.pyplot as plt
+
+        particle_parameters={
+            'amplitude' : 1e36 / u.eV,
+            'e_0' : 1 * u.TeV,
+            'alpha' : 2.1,
+             'e_cutoff' : 13 * u.TeV,
+        }
+        radiative_parameters={
+            'B' : 100 * u.uG,
+            'seed_photon_fields' : ['CMB', 'FIR', 'NIR']
+        }
+        SSC_ECPL = SynchrotronSelfCompton(
+            particle_distribution="ExponentialCutoffPowerLaw",
+            particle_parameters=particle_parameters,
+            radiative_model="PionDecay",
+            radiative_parameters=radiative_parameters,
+            syn_emin = 1e-6 * u.eV,
+            syn_emax = 1e5 * u.eV,
+            source_radius = 2 * u.pc,
+        )
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+        opts = {
+            "energy_range": [1e-1 * u.eV, 1e2 * u.TeV],
+            "energy_power": 2,
+            "flux_unit": "erg-1 cm-2 s-1",
+        }
+        ax.set_ylim([1e-12, 1e-6]);
+
+        SSC_ECPL.synchrotron_model.plot(label="Synchrotron", **opts)
+        SSC_ECPL.ic_model.plot(label="Inverse Compton", **opts)
+
+        plt.legend()
+        plt.show()
+    """
+
+    __slots__ = [
+        "syn_emin",
+        "syn_emax",
+        "num",
+        "source_radius",
+        "_distance",
+        "synchrotron_model",
+        "ic_model",
+    ]
+
+    def __init__(
+        self,
+        particle_distribution,
+        particle_parameters,
+        radiative_parameters,
+        source_radius,
+        syn_emin=1e-6 * u.eV,
+        syn_emax=10 * u.MeV,
+        num=100,
+        distance=1.0 * u.kpc,
+    ):
+        self.syn_emin = syn_emin
+        self.syn_emax = syn_emax.to(syn_emin.unit)
+        self.num = num
+        self.source_radius = source_radius
+        self._distance = Parameter("distance", distance)
+        syn_parameters = {"B": radiative_parameters.pop("B")}
+        self.synchrotron_model = NaimaModel(
+            particle_distribution=particle_distribution,
+            particle_parameters=particle_parameters,
+            radiative_model="Synchrotron",
+            radiative_parameters=syn_parameters,
+            distance=self.distance.quantity,
+        )
+        ic_parameters = self._seed_photon_fields(radiative_parameters)
+        self.ic_model = NaimaModel(
+            particle_distribution=particle_distribution,
+            particle_parameters=particle_parameters,
+            radiative_model="InverseCompton",
+            radiative_parameters=ic_parameters,
+            distance=self.distance.quantity,
+        )
+
+    @property
+    def distance(self):
+        """"""
+        return self._distance
+
+    @distance.setter
+    def distance(self, distance):
+        self._distance = distance
+
+    def _seed_photon_fields(self, kwargs):
+        syn_energies = u.Quantity(
+            np.logspace(
+                np.log10(self.syn_emin.value), np.log10(self.syn_emax.value), self.num
+            ),
+            self.syn_emin.unit,
+            copy=False,
+        )
+        syn_luminosity = self.synchrotron_model.radiative_model.flux(
+            syn_energies, distance=0 * u.kpc
+        )
+        syn_seed = syn_luminosity * 2.24 / (4 * np.pi * self.source_radius ** 2 * c)
+        kwargs["seed_photon_fields"] = list(kwargs["seed_photon_fields"]) + [
+            ["SSC", syn_energies, syn_seed]
+        ]
+
+        return kwargs

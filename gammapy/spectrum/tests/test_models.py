@@ -15,6 +15,7 @@ from ..models import (
     AbsorbedSpectralModel,
     Absorption,
     ConstantModel,
+    NaimaModel,
 )
 
 
@@ -191,6 +192,48 @@ try:
     )
 except ImportError:
     pass
+
+# Add naima models
+TEST_MODELS.append(
+    dict(
+        name="naima1",
+        model=NaimaModel(
+            particle_distribution="ExponentialCutoffPowerLaw",
+            particle_parameters={
+                "amplitude": 2e33 / u.eV,
+                "e_0": 10 * u.TeV,
+                "alpha": 2.5,
+                "e_cutoff": 10 * u.TeV,
+            },
+            radiative_model="PionDecay",
+            radiative_parameters={"nh": 1.0 * u.cm ** -3},
+        ),
+        val_at_2TeV=u.Quantity(2.3455964e-14, "cm-2 s-1 TeV-1"),
+        integral_1_10TeV=u.Quantity(9.6464295e-14, "cm-2 s-1"),
+        eflux_1_10TeV=u.Quantity(1.5598024e-13, "TeV cm-2 s-1"),
+    )
+)
+
+TEST_MODELS.append(
+    dict(
+        name="naima2",
+        model=NaimaModel(
+            particle_distribution="LogParabola",
+            particle_parameters={
+                "amplitude": 2e33 * u.eV ** -1,
+                "e_0": 10 * u.TeV,
+                "alpha": 2.5,
+                "beta": 1.0,
+            },
+            radiative_model="InverseCompton",
+            radiative_parameters={"seed_photon_fields": ["CMB"]},
+            distance=2 * u.kpc,
+        ),
+        val_at_2TeV=u.Quantity(8.3234886e-12, "cm-2 s-1 TeV-1"),
+        integral_1_10TeV=u.Quantity(2.8326988e-11, "cm-2 s-1"),
+        eflux_1_10TeV=u.Quantity(5.6617281e-11, "TeV cm-2 s-1"),
+    )
+)
 
 
 @requires_dependency("uncertainties")
