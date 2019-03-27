@@ -1534,7 +1534,13 @@ class NaimaModel(SpectralModel):
         plt.show()
     """
 
-    __slots__ = ["particle_distribution", "radiative_model", "distance"]
+    __slots__ = [
+        "particle_distribution",
+        "radiative_model",
+        "_particle_distribution",
+        "_particle_parameters",
+        "distance",
+    ]
 
     def __init__(
         self,
@@ -1551,6 +1557,8 @@ class NaimaModel(SpectralModel):
         self.radiative_model = self._get_from_naima(
             radiative_model, radiative_parameters
         )
+        self._particle_distribution = particle_distribution
+        self._particle_parameters = particle_parameters
         self.distance = Parameter("distance", distance)
         #     add the possibility to normalize using the (observed) gamma-ray energy flux
         super().__init__([self.distance])
@@ -1560,6 +1568,7 @@ class NaimaModel(SpectralModel):
         if distance == None:
             distance = self.distance.quantity
         eval = self.evaluate(energy.flatten(), self.radiative_model, distance)
+
         return eval.reshape(energy.shape)
 
     def _get_from_naima(self, name, kwargs):
@@ -1578,20 +1587,36 @@ class NaimaModel(SpectralModel):
             "EblAbsorptionModel": naima.models.EblAbsorptionModel,
         }[name](**kwargs)
 
+    def plot(self, energy_range, seed=None, **opts):
+        """Plot spectral model curve"""
+        if seed == None:
+            super(NaimaModel, self).plot(energy_range, **opts)
+        else:
+            ic_model = NaimaModel(
+                particle_distribution=self._particle_distribution,
+                particle_parameters=self._particle_parameters,
+                radiative_model="InverseCompton",
+                radiative_parameters={"seed_photon_fields": seed},
+                distance=self.distance.quantity,
+            )
+            super(NaimaModel, ic_model).plot(energy_range, **opts)
+
     @staticmethod
     def evaluate(energy, radiative_model, distance):
         """Evaluate the model (static function)."""
         dnde = radiative_model.flux(energy, distance=distance)
+
         return dnde.to("cm-2 s-1 TeV-1")
 
 
 class SynchrotronSelfCompton:
-    r"""A Syncrotron Self Compton spectral model, based on `Naima <https://naima.readthedocs.io/en/latest/>`_ models
+    r"""A Syncrotron Self Compton (SSC) spectral model, based on `Naima <https://naima.readthedocs.io/en/latest/>`_
+    models
 
-    This model convolves a `particle_distribution`, describing an assumed electron
-    energy spectrum, with the synchrotron `radiative_model` defined in `naima.radiative`. The latter is used, under the
-     assumption that the source is spherycally symmetric, to compute the synchrotron photon field to be passed
-      (along with the CMB, FIR, etc.) as a seed for the inverse Compton `radiative_model`.
+    This model convolves a `particle_distribution`, describing an assumed electron energy spectrum,
+    with the synchrotron `radiative_model` defined in the `naima.radiative` model. The latter is used, under the
+    assumption of a spherycally symmetric source, to obtain the synchrotron photon field to be passed as a seed
+    to an inverse Compton `radiative_model`.
 
 
     Parameters
@@ -1601,33 +1626,31 @@ class SynchrotronSelfCompton:
     particle_parameters : `dict`
         Dictionary of parameters defining the `particle_distribution`.
     radiative_parameters : `dict`
-        Dictionary of parameters defining the both the Synchrotson and the InverseCompton `radiative_model`s.
-        Those are, respectively, the intensity of the magnetic field `"B"` and a list of the '"seed_photon_fields"'.
+        Dictionary of parameters defining both the Synchrotson and the InverseCompton `radiative_model`.
+        Those are, respectively, the intensity of the magnetic field 'B' and a list of the 'seed_photon_fields'.
     distance : :class:`~astropy.units.Quantity` (optional)
         Distance to the source. If set to 0, the intrinsic differential luminosity will be returned. Default is 1 kpc.
-    source_radius: :class:`~astropy.units.Quantity`
+    source_radius : :class:`~astropy.units.Quantity`
         Radius of the spherically symmetric source.
-    syn_emin: :class:`~astropy.units.Quantity`
+    syn_emin : :class:`~astropy.units.Quantity`
         Minimum energy used to compute the synchrotron seed photon field. The energy range should
-         capture most of the synchrotron output.
-
-    syn_emax: :class:`~astropy.units.Quantity`
+        capture most of the synchrotron output.
+    syn_emax : :class:`~astropy.units.Quantity`
         Maximum energy used to compute the synchrotron seed photon field. The energy range should
-         capture most of the synchrotron output.
-    num: `float` (optional)
+        capture most of the synchrotron output.
+    num : `float` (optional)
         Number of logarithmic energy bins used to compute the synchrotron seed photon field. Default is 100.
 
 
     Examples
     --------
     Create and plot a model that convolves an exponential cutoff electron `particle_distribution`
-    with a synchrotron self Compton radiative model, in the presence of a magnetic field :math:`B=100\,\mu G` and the
-    CMB, FIR and NIR photon fields.
+    with an SSC radiative model, in the presence of magnetic field and multiple low-energy photon photon fields.
 
     .. plot::
         :include-source:
 
-        from gammapy.spectrum.models import NaimaModel
+        from gammapy.spectrum.models import SynchrotronSelfCompton
         from astropy import units as u
         import numpy as np
         import matplotlib.pyplot as plt
@@ -1661,17 +1684,19 @@ class SynchrotronSelfCompton:
         ax.set_ylim([1e-12, 1e-6]);
 
         SSC_ECPL.synchrotron_model.plot(label="Synchrotron", **opts)
-        SSC_ECPL.ic_model.plot(label="Inverse Compton", **opts)
+        SSC_ECPL.ic_model.plot(label="IC (total)", **opts)
+        for seed, ls in zip(['CMB','FIR','NIR'], ['-','--',':']):
+            SSC_ECPL.ic_model.plot(label="IC ({})".format(seed), seed=seed, ls=ls, **opts)
 
         plt.legend()
         plt.show()
     """
 
     __slots__ = [
-        "syn_emin",
-        "syn_emax",
-        "num",
-        "source_radius",
+        "_syn_emin",
+        "_syn_emax",
+        "_num",
+        "_source_radius",
         "_distance",
         "synchrotron_model",
         "ic_model",
@@ -1688,10 +1713,10 @@ class SynchrotronSelfCompton:
         num=100,
         distance=1.0 * u.kpc,
     ):
-        self.syn_emin = syn_emin
-        self.syn_emax = syn_emax.to(syn_emin.unit)
-        self.num = num
-        self.source_radius = source_radius
+        self._syn_emin = syn_emin
+        self._syn_emax = syn_emax.to(syn_emin.unit)
+        self._num = num
+        self._source_radius = source_radius
         self._distance = Parameter("distance", distance)
         syn_parameters = {"B": radiative_parameters.pop("B")}
         self.synchrotron_model = NaimaModel(
@@ -1722,15 +1747,15 @@ class SynchrotronSelfCompton:
     def _seed_photon_fields(self, kwargs):
         syn_energies = u.Quantity(
             np.logspace(
-                np.log10(self.syn_emin.value), np.log10(self.syn_emax.value), self.num
+                np.log10(self._syn_emin.value), np.log10(self._syn_emax.value), self._num
             ),
-            self.syn_emin.unit,
+            self._syn_emin.unit,
             copy=False,
         )
         syn_luminosity = self.synchrotron_model.radiative_model.flux(
             syn_energies, distance=0 * u.kpc
         )
-        syn_seed = syn_luminosity * 2.24 / (4 * np.pi * self.source_radius ** 2 * c)
+        syn_seed = syn_luminosity * 2.24 / (4 * np.pi * self._source_radius ** 2 * c)
         kwargs["seed_photon_fields"] = list(kwargs["seed_photon_fields"]) + [
             ["SSC", syn_energies, syn_seed]
         ]
