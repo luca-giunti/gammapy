@@ -1537,8 +1537,8 @@ class NaimaModel(SpectralModel):
     __slots__ = [
         "particle_distribution",
         "radiative_model",
-        "_particle_distribution",
-        "_particle_parameters",
+        "_radiative_model",
+        "_radiative_parameters",
         "distance",
     ]
 
@@ -1557,17 +1557,18 @@ class NaimaModel(SpectralModel):
         self.radiative_model = self._get_from_naima(
             radiative_model, radiative_parameters
         )
-        self._particle_distribution = particle_distribution
-        self._particle_parameters = particle_parameters
+        self._radiative_model = radiative_model
+        self._radiative_parameters = radiative_parameters
+
         self.distance = Parameter("distance", distance)
         #     add the possibility to normalize using the (observed) gamma-ray energy flux
         super().__init__([self.distance])
 
-    def __call__(self, energy, distance=None):
+    def __call__(self, energy, seed=None, distance=None):
         """Call evaluate method"""
         if distance == None:
             distance = self.distance.quantity
-        eval = self.evaluate(energy.flatten(), self.radiative_model, distance)
+        eval = self.evaluate(energy.flatten(), self.radiative_model, seed, distance)
 
         return eval.reshape(energy.shape)
 
@@ -1587,24 +1588,68 @@ class NaimaModel(SpectralModel):
             "EblAbsorptionModel": naima.models.EblAbsorptionModel,
         }[name](**kwargs)
 
-    def plot(self, energy_range, seed=None, **opts):
-        """Plot spectral model curve"""
-        if seed == None:
-            super(NaimaModel, self).plot(energy_range, **opts)
-        else:
-            ic_model = NaimaModel(
-                particle_distribution=self._particle_distribution,
-                particle_parameters=self._particle_parameters,
-                radiative_model="InverseCompton",
-                radiative_parameters={"seed_photon_fields": seed},
-                distance=self.distance.quantity,
-            )
-            super(NaimaModel, ic_model).plot(energy_range, **opts)
+    def plot(
+        self,
+        energy_range,
+        ax=None,
+        energy_unit="TeV",
+        flux_unit="cm-2 s-1 TeV-1",
+        energy_power=0,
+        n_points=100,
+        seed=None,
+        **kwargs
+    ):
+        """Plot spectral model curve.
+
+        kwargs are forwarded to `matplotlib.pyplot.plot`
+
+        By default a log-log scaling of the axes is used.
+
+        Parameters
+        ----------
+        ax : `~matplotlib.axes.Axes`, optional
+            Axis
+        energy_range : `~astropy.units.Quantity`
+            Plot range
+        energy_unit : str, `~astropy.units.Unit`, optional
+            Unit of the energy axis
+        flux_unit : str, `~astropy.units.Unit`, optional
+            Unit of the flux axis
+        energy_power : int, optional
+            Power of energy to multiply flux axis with
+        n_points : int, optional
+            Number of evaluation nodes
+        seed : str, optional
+            Photon field to be used as seed, in case of an inverse Compton `radiative_model`
+        Returns
+        -------
+        ax : `~matplotlib.axes.Axes`, optional
+            Axis
+        """
+        import matplotlib.pyplot as plt
+
+        ax = plt.gca() if ax is None else ax
+
+        emin, emax = energy_range
+        energy = EnergyBounds.equal_log_spacing(emin, emax, n_points, energy_unit)
+
+        # evaluate model
+        flux = self(energy, seed=seed).to(flux_unit)
+
+        y = self._plot_scale_flux(energy, flux, energy_power)
+
+        ax.plot(energy.value, y.value, **kwargs)
+
+        self._plot_format_ax(ax, energy, y, energy_power)
+        return ax
 
     @staticmethod
-    def evaluate(energy, radiative_model, distance):
+    def evaluate(energy, radiative_model, seed, distance):
         """Evaluate the model (static function)."""
-        dnde = radiative_model.flux(energy, distance=distance)
+        if seed == None:
+            dnde = radiative_model.flux(energy, distance=distance)
+        else:
+            dnde = radiative_model.flux(energy, seed=seed, distance=distance)
 
         return dnde.to("cm-2 s-1 TeV-1")
 
@@ -1685,8 +1730,9 @@ class SynchrotronSelfCompton:
 
         SSC_ECPL.synchrotron_model.plot(label="Synchrotron", **opts)
         SSC_ECPL.ic_model.plot(label="IC (total)", **opts)
-        for seed, ls in zip(['CMB','FIR','NIR'], ['-','--',':']):
-            SSC_ECPL.ic_model.plot(label="IC ({})".format(seed), seed=seed, ls=ls, **opts)
+        for seed, ls in zip(['CMB','FIR','NIR','SSC'], ['--','-.',':', '-']):
+        SSC_ECPL.ic_model.plot(seed=seed, label="IC ({})".format(seed), ls=ls, color="gray", **opts)
+
 
         plt.legend()
         plt.show()
@@ -1700,6 +1746,7 @@ class SynchrotronSelfCompton:
         "_distance",
         "synchrotron_model",
         "ic_model",
+        "_ic_parameters",
     ]
 
     def __init__(
@@ -1726,12 +1773,12 @@ class SynchrotronSelfCompton:
             radiative_parameters=syn_parameters,
             distance=self.distance.quantity,
         )
-        ic_parameters = self._seed_photon_fields(radiative_parameters)
+        self._ic_parameters = self._seed_photon_fields(radiative_parameters)
         self.ic_model = NaimaModel(
             particle_distribution=particle_distribution,
             particle_parameters=particle_parameters,
             radiative_model="InverseCompton",
-            radiative_parameters=ic_parameters,
+            radiative_parameters=self._ic_parameters,
             distance=self.distance.quantity,
         )
 
@@ -1747,7 +1794,9 @@ class SynchrotronSelfCompton:
     def _seed_photon_fields(self, kwargs):
         syn_energies = u.Quantity(
             np.logspace(
-                np.log10(self._syn_emin.value), np.log10(self._syn_emax.value), self._num
+                np.log10(self._syn_emin.value),
+                np.log10(self._syn_emax.value),
+                self._num,
             ),
             self._syn_emin.unit,
             copy=False,
